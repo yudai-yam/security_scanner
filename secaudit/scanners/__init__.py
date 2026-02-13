@@ -3,6 +3,7 @@
 from secaudit.scanners.base import BaseScanner
 from secaudit.scanners.code import CodeScanner
 from secaudit.scanners.dependencies import DependencyScanner
+from secaudit.scanners.git_history import GitHistoryScanner
 from secaudit.scanners.headers import HeaderScanner
 from secaudit.scanners.secrets import SecretScanner
 from secaudit.scanners.tls import TLSScanner
@@ -13,6 +14,7 @@ SCANNERS: dict[str, type[BaseScanner]] = {
     "secrets": SecretScanner,
     "dependencies": DependencyScanner,
     "code": CodeScanner,
+    "git-history": GitHistoryScanner,
 }
 
 __all__ = [
@@ -22,5 +24,6 @@ __all__ = [
     "SecretScanner",
     "DependencyScanner",
     "CodeScanner",
+    "GitHistoryScanner",
     "SCANNERS",
 ]

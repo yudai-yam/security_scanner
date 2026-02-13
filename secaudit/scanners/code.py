@@ -43,9 +43,20 @@ class _SecurityVisitor(ast.NodeVisitor):
     def __init__(self, filepath: str, result: ScanResult):
         self.filepath = filepath
         self.result = result
+        self.imported_modules: set[str] = set()
 
     def _loc(self, node: ast.AST) -> str:
         return f"{self.filepath}:{node.lineno}"
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            self.imported_modules.add(alias.name.split(".")[0])
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if node.module:
+            self.imported_modules.add(node.module.split(".")[0])
+        self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
         self._check_eval_exec(node)
@@ -53,11 +64,20 @@ class _SecurityVisitor(ast.NodeVisitor):
         self._check_pickle_loads(node)
         self._check_weak_crypto(node)
         self._check_sql_injection(node)
+        self._check_yaml_load(node)
+        self._check_xml_parse(node)
+        self._check_os_system(node)
+        self._check_flask_debug(node)
+        self._check_tempfile_mktemp(node)
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self._check_debug_flag(node)
         self._check_hardcoded_secrets(node)
+        self.generic_visit(node)
+
+    def visit_Assert(self, node: ast.Assert) -> None:
+        self._check_assert_security(node)
         self.generic_visit(node)
 
     def _check_eval_exec(self, node: ast.Call) -> None:
@@ -204,3 +224,136 @@ class _SecurityVisitor(ast.NodeVisitor):
                                     cwe_id="CWE-798",
                                 )
                             )
+
+    def _check_yaml_load(self, node: ast.Call) -> None:
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "load"):
+            return
+        if not (isinstance(func.value, ast.Name) and func.value.id == "yaml"):
+            return
+        # Check if SafeLoader is used
+        for kw in node.keywords:
+            if kw.arg == "Loader":
+                if isinstance(kw.value, ast.Attribute) and "Safe" in kw.value.attr:
+                    return
+                if isinstance(kw.value, ast.Name) and "Safe" in kw.value.id:
+                    return
+        self.result.findings.append(
+            Finding(
+                scanner="code",
+                severity=Severity.HIGH,
+                title="Unsafe YAML load",
+                description="yaml.load() without SafeLoader can execute arbitrary Python code.",
+                location=self._loc(node),
+                remediation="Use yaml.safe_load() or yaml.load(data, Loader=yaml.SafeLoader).",
+                cwe_id="CWE-502",
+            )
+        )
+
+    def _check_xml_parse(self, node: ast.Call) -> None:
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "parse":
+            if isinstance(func.value, ast.Attribute):
+                # xml.etree.ElementTree.parse(...)
+                if isinstance(func.value.value, ast.Attribute):
+                    if (isinstance(func.value.value.value, ast.Name)
+                            and func.value.value.value.id == "xml"):
+                        self._add_xxe_finding(node)
+                        return
+                # ET.parse(...) when xml was imported
+                if isinstance(func.value, ast.Name) and func.value.id == "ET":
+                    if "xml" in self.imported_modules:
+                        self._add_xxe_finding(node)
+                        return
+            if isinstance(func.value, ast.Name) and func.value.id == "ET":
+                if "xml" in self.imported_modules:
+                    self._add_xxe_finding(node)
+        # Also check for ElementTree.fromstring / iterparse
+        if isinstance(func, ast.Attribute) and func.attr in ("fromstring", "iterparse", "parse"):
+            if isinstance(func.value, ast.Name) and func.value.id in ("ET", "ElementTree"):
+                if "xml" in self.imported_modules:
+                    self._add_xxe_finding(node)
+
+    def _add_xxe_finding(self, node: ast.Call) -> None:
+        self.result.findings.append(
+            Finding(
+                scanner="code",
+                severity=Severity.HIGH,
+                title="Potential XXE vulnerability",
+                description="xml.etree is vulnerable to XXE attacks. Use defusedxml instead.",
+                location=self._loc(node),
+                remediation="Replace xml.etree with defusedxml.ElementTree.",
+                cwe_id="CWE-611",
+            )
+        )
+
+    def _check_os_system(self, node: ast.Call) -> None:
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr in ("system", "popen"):
+            if isinstance(func.value, ast.Name) and func.value.id == "os":
+                self.result.findings.append(
+                    Finding(
+                        scanner="code",
+                        severity=Severity.HIGH,
+                        title=f"Use of os.{func.attr}()",
+                        description=f"os.{func.attr}() executes commands via the shell and is vulnerable to injection.",
+                        location=self._loc(node),
+                        remediation="Use subprocess.run() with a list of arguments instead.",
+                        cwe_id="CWE-78",
+                    )
+                )
+
+    def _check_assert_security(self, node: ast.Assert) -> None:
+        # Check if the assert test references security-related names
+        source = ast.dump(node.test)
+        security_keywords = ("auth", "permission", "role", "admin", "token",
+                             "password", "session", "login", "access", "allowed")
+        source_lower = source.lower()
+        if any(kw in source_lower for kw in security_keywords):
+            self.result.findings.append(
+                Finding(
+                    scanner="code",
+                    severity=Severity.MEDIUM,
+                    title="Assert used for security check",
+                    description="assert statements are removed when Python runs with -O flag.",
+                    location=self._loc(node),
+                    remediation="Use if/raise instead of assert for security checks.",
+                    cwe_id="CWE-617",
+                )
+            )
+
+    def _check_flask_debug(self, node: ast.Call) -> None:
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "run"):
+            return
+        if not (isinstance(func.value, ast.Name) and func.value.id == "app"):
+            return
+        for kw in node.keywords:
+            if kw.arg == "debug" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+                self.result.findings.append(
+                    Finding(
+                        scanner="code",
+                        severity=Severity.HIGH,
+                        title="Flask debug mode enabled",
+                        description="app.run(debug=True) enables the Werkzeug debugger, which allows RCE.",
+                        location=self._loc(node),
+                        remediation="Never use debug=True in production. Use environment variables.",
+                        cwe_id="CWE-489",
+                    )
+                )
+
+    def _check_tempfile_mktemp(self, node: ast.Call) -> None:
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "mktemp":
+            if isinstance(func.value, ast.Name) and func.value.id == "tempfile":
+                self.result.findings.append(
+                    Finding(
+                        scanner="code",
+                        severity=Severity.MEDIUM,
+                        title="Use of tempfile.mktemp()",
+                        description="tempfile.mktemp() is vulnerable to race conditions (TOCTOU).",
+                        location=self._loc(node),
+                        remediation="Use tempfile.mkstemp() or tempfile.NamedTemporaryFile() instead.",
+                        cwe_id="CWE-377",
+                    )
+                )
